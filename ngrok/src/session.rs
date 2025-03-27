@@ -1,15 +1,8 @@
 use std::{
-    collections::{
-        HashMap,
-        VecDeque,
-    },
-    env,
-    io,
+    collections::{HashMap, VecDeque},
+    env, io,
     sync::{
-        atomic::{
-            AtomicBool,
-            Ordering,
-        },
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
     time::Duration,
@@ -18,111 +11,48 @@ use std::{
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{
-    prelude::*,
-    FutureExt,
-};
-use futures_rustls::rustls::{
-    self,
-    pki_types,
-    RootCertStore,
-};
-use hyper_0_14::{
-    client::HttpConnector,
-    service::Service,
-};
-use hyper_proxy::{
-    Intercept,
-    Proxy,
-    ProxyConnector,
-};
+use futures::{prelude::*, FutureExt};
+use futures_rustls::rustls::{self, pki_types, RootCertStore};
 use muxado::heartbeat::HeartbeatConfig;
 pub use muxado::heartbeat::HeartbeatHandler;
-use once_cell::sync::{
-    Lazy,
-    OnceCell,
-};
+use once_cell::sync::{Lazy, OnceCell};
 use regex::Regex;
 use rustls_pemfile::Item;
 use thiserror::Error;
 use tokio::{
-    io::{
-        AsyncRead,
-        AsyncWrite,
-    },
+    io::{AsyncRead, AsyncWrite},
     runtime::Handle,
     sync::{
-        mpsc::{
-            channel,
-            Sender,
-        },
-        Mutex,
-        RwLock,
+        mpsc::{channel, Sender},
+        Mutex, RwLock,
     },
 };
-use tokio_retry::{
-    strategy::ExponentialBackoff,
-    RetryIf,
-};
-use tokio_util::compat::{
-    FuturesAsyncReadCompatExt,
-    TokioAsyncReadCompatExt,
-};
-use tracing::{
-    debug,
-    warn,
-};
+use tokio_retry::{strategy::ExponentialBackoff, RetryIf};
+use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
+use tracing::{debug, warn};
 use url::Url;
 
 pub use crate::internals::{
-    proto::{
-        CommandResp,
-        Restart,
-        Stop,
-        StopTunnel,
-        Update,
-    },
-    raw_session::{
-        CommandHandler,
-        RpcError,
-    },
+    proto::{CommandResp, Restart, Stop, StopTunnel, Update},
+    raw_session::{CommandHandler, RpcError},
 };
 use crate::{
     config::{
-        HttpTunnelBuilder,
-        LabeledTunnelBuilder,
-        ProxyProto,
-        TcpTunnelBuilder,
-        TlsTunnelBuilder,
+        HttpTunnelBuilder, LabeledTunnelBuilder, ProxyProto, TcpTunnelBuilder, TlsTunnelBuilder,
         TunnelConfig,
     },
     conn::ConnInner,
     internals::{
         proto::{
-            AuthExtra,
-            BindExtra,
-            BindOpts,
-            Error,
-            HttpEndpoint,
-            SecretString,
-            TcpEndpoint,
+            AuthExtra, BindExtra, BindOpts, Error, HttpEndpoint, SecretString, TcpEndpoint,
             TlsEndpoint,
         },
         raw_session::{
-            AcceptError as RawAcceptError,
-            CommandHandlers,
-            IncomingStreams,
-            RawSession,
-            RpcClient,
-            StartSessionError,
-            NOT_IMPLEMENTED,
+            AcceptError as RawAcceptError, CommandHandlers, IncomingStreams, RawSession, RpcClient,
+            StartSessionError, NOT_IMPLEMENTED,
         },
     },
-    tunnel::{
-        AcceptError,
-        TunnelInner,
-        TunnelInnerInfo,
-    },
+    tunnel::{AcceptError, TunnelInner, TunnelInnerInfo},
 };
 
 pub(crate) const CERT_BYTES: &[u8] = include_bytes!("../assets/ngrok.ca.crt");
@@ -255,38 +185,86 @@ fn connect_proxy(url: Url) -> Result<Arc<dyn Connector>, ProxyUnsupportedError> 
     })
 }
 
+struct StreamWrapper<S> {
+    stream: S,
+}
+
+impl<S> AsyncRead for StreamWrapper<S>
+where
+    S: Stream<Item = Result<bytes::Bytes, std::io::Error>> + Unpin,
+{
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let stream = std::pin::Pin::new(&mut self.get_mut().stream);
+        match stream.poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => {
+                let available = std::cmp::min(bytes.len(), buf.remaining());
+                buf.put_slice(&bytes[..available]);
+                std::task::Poll::Ready(Ok(()))
+            }
+            std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Err(e)),
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(Ok(())),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl<S> AsyncWrite for StreamWrapper<S>
+where
+    S: Stream<Item = Result<bytes::Bytes, std::io::Error>> + Unpin,
+{
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        std::task::Poll::Ready(Ok(0))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
 fn connect_http_proxy(url: Url) -> impl Connector {
     move |host: String, port, tls_config, _| {
-        let mut proxy = Proxy::new(
-            Intercept::All,
-            url.as_str().try_into().expect("urls should be valid uris"),
-        );
-        proxy.force_connect();
-        let connector = HttpConnector::new();
+        let proxy_url = url.clone();
+        let server_uri: Url = format!("http://{host}:{port}")
+            .parse()
+            .expect("host should have been validated by SessionBuilder::server_addr");
+
         async move {
-            let mut connector = ProxyConnector::from_proxy(connector, proxy)
+            let client = reqwest::Client::builder()
+                .proxy(
+                    reqwest::Proxy::http(proxy_url.as_str())
+                        .map_err(|e| ConnectError::ProxyConnect(Box::new(e)))?,
+                )
+                .use_preconfigured_tls(tls_config)
+                .build()
                 .map_err(|e| ConnectError::ProxyConnect(Box::new(e)))?;
 
-            let server_uri = format!("http://{host}:{port}")
-                .parse()
-                .expect("host should have been validated by SessionBuilder::server_addr");
-
-            let conn = connector
-                .call(server_uri)
+            let stream = client
+                .get(server_uri)
+                .send()
                 .await
                 .map_err(|e| ConnectError::ProxyConnect(Box::new(e)))?
-                .compat();
+                .bytes_stream()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
 
-            let tls_conn = futures_rustls::TlsConnector::from(tls_config)
-                .connect(
-                    pki_types::ServerName::try_from(host)
-                        .expect("host should have been validated by SessionBuilder::server_addr"),
-                    conn,
-                )
-                .await
-                .map_err(ConnectError::Tls)?;
-
-            Ok(Box::new(tls_conn.compat()) as Box<dyn IoStream>)
+            Ok(Box::new(StreamWrapper { stream }) as Box<dyn IoStream>)
         }
     }
 }
