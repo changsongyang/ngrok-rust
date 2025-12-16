@@ -1,3 +1,9 @@
+## 0.18.0
+- Add support for CEL filtering when listing resources.
+- Add support for service users
+- Add support for `vault_name` on Secrets
+-Make `pooling_enabled` on Endpoints optional
+
 ## 0.17.0
 
 ### Breaking Changes
